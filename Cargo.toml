@@ -1,0 +1,30 @@
+[package]
+name    = "aegis-vault"
+version = "2.0.0"
+edition = "2021"
+
+[[bin]]
+name = "aegis-vault"
+path = "src/main.rs"
+
+[dependencies]
+# ── Cryptography ──────────────────────────────────────────────────────────────
+aes-gcm  = { version = "0.10", features = ["stream"] }
+argon2   = "0.5"          # replaces PBKDF2 — Argon2id is the modern standard
+rand     = "0.8"
+
+# ── Secure memory ─────────────────────────────────────────────────────────────
+zeroize  = { version = "1.7", features = ["derive"] }
+secrecy  = "0.8"          # SecretVec: zeroes password bytes on drop
+
+# ── Async runtime + I/O ───────────────────────────────────────────────────────
+tokio    = { version = "1", features = ["full"] }   # real async file I/O
+
+# ── GUI ───────────────────────────────────────────────────────────────────────
+iced     = { version = "0.12", features = ["tokio"] }
+
+[profile.release]
+opt-level     = 3
+lto           = true      # link-time optimisation for smaller, faster binary
+codegen-units = 1
+strip         = true      # strip debug symbols from release build
