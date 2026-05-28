@@ -1,0 +1,16 @@
+[package]
+name = "aegis_kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aes-gcm = "0.10"
+rand = "0.8"
+zeroize = { version = "1.7", features = ["derive"] }
+pbkdf2 = "0.12"
+sha2 = "0.10"
+# استبدل سطر iced القديم بهذا السطر الذي يقلل الاعتماد على أنظمة العرض المعقدة
+iced = { version = "0.10", features = ["tokio"] }
+
+tokio = { version = "1.35", features = ["full"] }
+
