@@ -1,6 +1,6 @@
 [package]
 name    = "aegis-vault"
-version = "2.0.0"
+version = "4.0.0"
 edition = "2021"
 
 [[bin]]
@@ -10,21 +10,40 @@ path = "src/main.rs"
 [dependencies]
 # ── Cryptography ──────────────────────────────────────────────────────────────
 aes-gcm  = { version = "0.10", features = ["stream"] }
-argon2   = "0.5"          # replaces PBKDF2 — Argon2id is the modern standard
-rand     = "0.8"
+argon2   = "0.5"
+hkdf     = "0.12"
+hmac     = "0.12"
+sha2     = "0.10"
+subtle   = "2.5"          # constant-time comparison
+rand     = { version = "0.8", features = ["getrandom"] }
 
 # ── Secure memory ─────────────────────────────────────────────────────────────
 zeroize  = { version = "1.7", features = ["derive"] }
-secrecy  = "0.8"          # SecretVec: zeroes password bytes on drop
+secrecy  = "0.8"
 
-# ── Async runtime + I/O ───────────────────────────────────────────────────────
-tokio    = { version = "1", features = ["full"] }   # real async file I/O
+# ── Nonce registry ────────────────────────────────────────────────────────────
+dashmap  = "5.5"          # lock-free concurrent HashMap for nonce dedup
+
+# ── Async runtime ─────────────────────────────────────────────────────────────
+tokio    = { version = "1", features = ["full"] }
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 iced     = { version = "0.12", features = ["tokio"] }
 
+# ── Platform file locking ─────────────────────────────────────────────────────
+[target.'cfg(unix)'.dependencies]
+libc     = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Foundation",
+]}
+
 [profile.release]
 opt-level     = 3
-lto           = true      # link-time optimisation for smaller, faster binary
+lto           = true
 codegen-units = 1
-strip         = true      # strip debug symbols from release build
+strip         = true
+panic         = "abort"   # eliminates unwinding attack surface
