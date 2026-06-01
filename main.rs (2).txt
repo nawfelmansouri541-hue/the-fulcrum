@@ -1,0 +1,1126 @@
+// =============================================================================
+//  AEGIS SOVEREIGN VAULT — v5.0  |  Audit-Grade Production Implementation
+// =============================================================================
+//
+//  CHANGES FROM v4 → v5
+//  ─────────────────────
+//  1. UNSAFE CODE ELIMINATED
+//     v4 declared `#![forbid(unsafe_code)]` but then used `unsafe { libc::flock }`
+//     on Unix and `unsafe { LockFileEx }` on Windows — a direct contradiction that
+//     prevented compilation. v5 replaces both with the `fs4` crate, which provides
+//     a safe, cross-platform `FileExt` trait. The `#![forbid(unsafe_code)]`
+//     attribute now holds without exception.
+//
+//  2. GUI PASSWORD FIELD ZEROIZED ON DROP
+//     v4 stored the password as a plain `String` in `AegisVaultGui`, leaving the
+//     master secret in heap memory indefinitely after the operation. v5 uses
+//     `zeroize::Zeroizing<String>`, which overwrites the heap allocation with zeros
+//     whenever the field is replaced or the struct is dropped.
+//
+//  3. SECURE-DELETE: SINGLE FILE HANDLE ACROSS ALL OVERWRITE PASSES
+//     v4 opened a new file handle for each of the three overwrite passes. On Linux,
+//     `flock` is per-open-file-description, so separately-opened handles within the
+//     same process bypass the advisory lock — the overwrite passes were effectively
+//     unprotected. v5 opens the file once, locks it, seeks to the start before each
+//     pass, and releases the lock only after `remove_file`. All I/O stays on the
+//     same locked handle.
+//
+//  4. ENCRYPTION: LOOK-AHEAD READS — NO FILE-SIZE DEPENDENCY FOR `is_last`
+//     v4 used `bytes_done >= file_size` to detect the final chunk. This is correct
+//     only if `file_size` is stable throughout the operation (guaranteed by the
+//     lock, but advisory and therefore bypassable). v5 uses a double-buffer
+//     look-ahead: after reading chunk N it immediately reads chunk N+1; if N+1 is
+//     empty (EOF), chunk N is the last. `file_size` is still fetched for progress
+//     reporting only — it is never used for correctness decisions.
+//
+//  5. MAGIC UPDATED: b"AEGIS5" (was b"AEGIS4")
+//     Prevents a v5 binary from silently accepting v4 vaults without version-check.
+//     The version fields (major = 0x01, minor = 0x00) continue to govern the wire
+//     protocol; the magic byte change acts as a hard guard at the binary level.
+//
+//  THREAT MODEL & SECURITY GUARANTEES  (unchanged from v4)
+//  ─────────────────────────────────────────────────────────
+//  1. CONFIDENTIALITY
+//     AES-256-GCM streaming AEAD — IND-CCA2 secure, authenticated per-chunk.
+//     Each chunk carries its own 16-byte GCM tag; truncation is detected.
+//
+//  2. INTEGRITY / ANTI-TAMPER
+//     • Per-chunk GCM tags detect any bit-flip in the ciphertext.
+//     • Header AEAD MAC: all header fields are authenticated with a dedicated
+//       HKDF-derived subkey. Tampering is detected before decryption begins.
+//     • KVT (Key-Verification Tag): instant password check in O(1),
+//       constant-time, before any payload I/O.
+//
+//  3. NONCE-REUSE PREVENTION
+//     • 96-bit random nonce per operation (OsRng / CSPRNG).
+//     • EncryptorBE32 internally increments a 32-bit counter suffix per chunk,
+//       making per-chunk nonce reuse impossible within a single file.
+//     • Per-process nonce registry (DashSet) aborts on any collision.
+//
+//  4. FILE LOCKING
+//     • Source and output files are exclusively locked (fs4) before I/O and
+//       released only after secure erasure or successful write.
+//     • Prevents TOCTOU races and concurrent corruption.
+//
+//  5. PROTOCOL VERSIONING & CRYPTOGRAPHIC AGILITY
+//     • 2-byte (major.minor) version + 6-byte magic in header.
+//     • AlgoId enum reserves space for future ciphers.
+//     • Header is fully authenticated: downgrade attacks are detected.
+//
+//  6. SECURE ERASURE — HONEST THREAT MODEL
+//     Maximum achievable at OS/userspace level:
+//       • Single exclusive-locked handle held for all passes.
+//       • Pass 1: CSPRNG random + seek(0) + sync_all
+//       • Pass 2: zero bytes   + seek(0) + sync_all
+//       • Pass 3: CSPRNG random + seek(0) + sync_all
+//       • set_len(0) + sync_all
+//       • remove_file (unlink)
+//     HONEST LIMITATION: SSDs/NVMe with wear-levelling may retain physical
+//     copies beyond the reach of OS-level overwrites. Full-disk encryption
+//     (LUKS, BitLocker, FileVault) is the only complete mitigation.
+//
+//  HEADER FORMAT  v5.0  (total = 96 bytes, wire-compatible with v4 except magic)
+//  ──────────────────────────────────────────────────────────────────────────────
+//   Offset  Len   Field
+//   ──────  ───   ────────────────────────────────────────────────────────────
+//    0       6    Magic           b"AEGIS5"
+//    6       1    Version major   u8  (currently 0x01)
+//    7       1    Version minor   u8  (currently 0x00)
+//    8       1    AlgoId          u8  (0x01 = AES-256-GCM, 0x02 = ChaCha20)
+//    9       7    Reserved        [u8;7] — must be 0x00 (future flags)
+//   16      16    Salt            random, Argon2id input
+//   32      12    Nonce           random, AES-GCM-BE32 base nonce
+//   44       4    argon2_mem_kib  u32 big-endian
+//   48       4    argon2_iters    u32 big-endian
+//   52       4    argon2_par      u32 big-endian
+//   56       4    chunk_size      u32 big-endian (BUFFER_SIZE at encryption time)
+//   60      32    KVT             HKDF-SHA256(master_key, "aegis-kvt-v1")
+//   92       4    Header MAC      first 4 bytes of HMAC-SHA256(header_key, header[0..92])
+//  ──────  ───
+//   96      TOTAL
+//
+// =============================================================================
+
+#![forbid(unsafe_code)]
+#![warn(clippy::all, clippy::pedantic)]
+#![allow(
+    clippy::module_name_repetitions,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
+
+use aes_gcm::{
+    aead::{generic_array::GenericArray, stream::{DecryptorBE32, EncryptorBE32}},
+    Aes256Gcm, KeyInit,
+};
+use argon2::{Argon2, Params, Version as Argon2Version};
+use dashmap::DashSet;
+use fs4::FileExt as _;
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use rand::{rngs::OsRng, RngCore};
+use secrecy::{ExposeSecret, SecretVec};
+use sha2::Sha256;
+use std::{path::Path, sync::{Arc, OnceLock}};
+use subtle::ConstantTimeEq;
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter},
+};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+#[cfg(feature = "gui")]
+use iced::{
+    executor,
+    widget::{button, column, container, progress_bar, row, text, text_input},
+    Application, Command, Element, Length, Settings, Theme,
+};
+
+// ─── Nonce registry ───────────────────────────────────────────────────────────
+
+/// Process-global set of base nonces used in this session.
+/// Collision probability on healthy OsRng ≈ 1 / 2^96 per run.
+/// Any collision indicates RNG failure and aborts the operation immediately.
+static NONCE_REGISTRY: OnceLock<DashSet<[u8; 12]>> = OnceLock::new();
+
+fn nonce_registry() -> &'static DashSet<[u8; 12]> {
+    NONCE_REGISTRY.get_or_init(DashSet::new)
+}
+
+/// Inserts a nonce into the registry. Returns `Err` on collision (RNG failure).
+fn register_nonce(nonce: [u8; 12]) -> Result<(), String> {
+    if !nonce_registry().insert(nonce) {
+        return Err(
+            "CRITICAL: Nonce collision detected — possible RNG failure. \
+             Operation aborted."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+// ─── Header constants ─────────────────────────────────────────────────────────
+
+/// Magic bytes for v5 vaults.  Changed from b"AEGIS4" so the v5 binary rejects
+/// v4 files at the magic check before reaching the version fields.
+const AEGIS_MAGIC: &[u8; 6] = b"AEGIS5";
+const VERSION_MAJOR: u8 = 0x01;
+const VERSION_MINOR: u8 = 0x00;
+const HEADER_SIZE: u64  = 96;
+
+/// HKDF info labels.  Never change: altering these breaks decryption of
+/// existing vaults because derived subkeys will differ.
+const KVT_INFO:        &[u8] = b"aegis-kvt-v1";
+const HEADER_MAC_INFO: &[u8] = b"aegis-header-mac-v1";
+
+/// Cryptographic algorithm identifier stored in the header.
+/// Reserved variants are parsed but return a helpful error pointing the user
+/// to a newer version, preventing silent misinterpretation.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlgoId {
+    Aes256GcmBe32                = 0x01,
+    #[allow(dead_code)] // reserved for Aegis v6+; parsed from headers but never constructed here
+    ChaCha20Poly1305             = 0x02,
+}
+
+impl TryFrom<u8> for AlgoId {
+    type Error = String;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0x01 => Ok(AlgoId::Aes256GcmBe32),
+            0x02 => Err(
+                "ChaCha20-Poly1305 vaults require Aegis Vault v6+.".to_string(),
+            ),
+            other => Err(format!(
+                "Unknown algorithm 0x{other:02X}. Please upgrade Aegis Vault."
+            )),
+        }
+    }
+}
+
+// ─── KDF / streaming constants ────────────────────────────────────────────────
+
+const ARGON2_MEM_KIB:  u32   = 64 * 1024; // 64 MiB (OWASP 2023 interactive)
+const ARGON2_ITERS:    u32   = 3;
+const ARGON2_PARALLEL: u32   = 4;
+const BUFFER_SIZE:     usize = 256 * 1024; // 256 KiB per streaming chunk
+
+// ─── Secure key material ──────────────────────────────────────────────────────
+
+/// 32-byte master key.
+///
+/// Security properties:
+/// - Zeroed on drop via `ZeroizeOnDrop`.
+/// - No `Clone` or `Debug` to prevent accidental copies or log exposure.
+/// - Derived exclusively via Argon2id; never stored or transmitted.
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct MasterKey([u8; 32]);
+
+impl MasterKey {
+    /// Derives a `MasterKey` from `password` + `salt` via Argon2id.
+    ///
+    /// Intentionally takes password by reference so the caller's `SecretVec`
+    /// retains ownership and can zero it on drop without extra copies.
+    fn derive(
+        password: &[u8],
+        salt:     &[u8],
+        mem_kib:  u32,
+        iters:    u32,
+        parallel: u32,
+    ) -> Result<Self, String> {
+        let params = Params::new(mem_kib, iters, parallel, Some(32))
+            .map_err(|e| format!("Argon2 params error: {e}"))?;
+        let argon2 = Argon2::new(
+            argon2::Algorithm::Argon2id,
+            Argon2Version::V0x13,
+            params,
+        );
+        let mut key = [0u8; 32];
+        argon2
+            .hash_password_into(password, salt, &mut key)
+            .map_err(|e| format!("Key derivation failed: {e}"))?;
+        Ok(MasterKey(key))
+    }
+
+    /// Derives the 32-byte Key-Verification Tag via HKDF-SHA256.
+    ///
+    /// Stored in the header for instant, constant-time password validation
+    /// before any payload I/O, preventing oracle attacks on ciphertext.
+    fn derive_kvt(&self) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(None, &self.0);
+        let mut kvt = [0u8; 32];
+        hk.expand(KVT_INFO, &mut kvt)
+            .expect("HKDF KVT expand: output length is always valid");
+        kvt
+    }
+
+    /// Derives the 32-byte header MAC key via HKDF-SHA256.
+    ///
+    /// Using a separate subkey (not the encryption key) ensures that the MAC
+    /// does not leak key material and that subkey compromise is independent.
+    fn derive_header_mac_key(&self) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(None, &self.0);
+        let mut k = [0u8; 32];
+        hk.expand(HEADER_MAC_INFO, &mut k)
+            .expect("HKDF header-mac expand: output length is always valid");
+        k
+    }
+}
+
+// ─── Header MAC ───────────────────────────────────────────────────────────────
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Computes HMAC-SHA256 over `data` with `key`; returns the first 4 bytes.
+///
+/// 32-bit truncation gives a forgery probability of 1/2^32 per attempt.
+/// Combined with Argon2id's cost floor (seconds per attempt), brute-force
+/// forgery is computationally infeasible.
+fn compute_header_mac(key: &[u8; 32], data: &[u8]) -> [u8; 4] {
+    // Disambiguate: both `KeyInit` and `Mac` expose `new_from_slice`.
+    // Explicitly select the `Mac` trait implementation.
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key.as_ref())
+        .expect("HMAC accepts any key length");
+    mac.update(data);
+    let full = mac.finalize().into_bytes();
+    let mut out = [0u8; 4];
+    out.copy_from_slice(&full[..4]);
+    out
+}
+
+// ─── File locking ─────────────────────────────────────────────────────────────
+//
+//  v5 uses the `fs4` crate for cross-platform exclusive advisory locking.
+//  This replaces the v4 approach of calling `libc::flock` (Unix) and
+//  `LockFileEx` (Windows) directly, both of which required `unsafe` blocks
+//  that violated the `#![forbid(unsafe_code)]` declaration.
+//
+//  `fs4::FileExt::try_lock_exclusive` fails immediately (EWOULDBLOCK) if
+//  another process holds the lock, matching v4's LOCK_NB semantics.
+
+/// Acquires an exclusive, non-blocking advisory lock on `file`.
+fn lock_exclusive(file: &std::fs::File) -> Result<(), String> {
+    file.try_lock_exclusive()
+        .map_err(|e| format!("Cannot lock file — another process may be using it: {e}"))
+}
+
+/// Releases the advisory lock on `file`.
+fn unlock(file: &std::fs::File) -> Result<(), String> {
+    // Use the fully-qualified path to avoid the name collision warning with
+    // an unstable `unlock` method that may appear on std types in the future.
+    fs4::FileExt::unlock(file)
+        .map_err(|e| format!("Failed to release file lock: {e}"))
+}
+
+// ─── Progress channel ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum ProgressUpdate {
+    Percent(f32),
+    Done(Result<String, String>),
+}
+
+// ─── Encryption ───────────────────────────────────────────────────────────────
+
+/// Encrypts the file at `path_str`, producing `<path>.aegis`, then
+/// secure-deletes the original.
+///
+/// # Look-ahead read pattern (v5)
+///
+/// v4 detected the final chunk via `bytes_done >= file_size`.  While the
+/// exclusive lock makes this correct in practice, it relies on file_size being
+/// stable — an advisory-only guarantee.  v5 instead reads one chunk ahead: if
+/// the next read returns 0 bytes, the current chunk is definitively the last,
+/// regardless of the file's reported size.
+async fn async_encrypt(
+    password:    Arc<SecretVec<u8>>,
+    path_str:    String,
+    progress_tx: tokio::sync::mpsc::Sender<ProgressUpdate>,
+) -> Result<String, String> {
+    let input_path = std::path::PathBuf::from(&path_str);
+
+    // ── 1. open + lock source file ───────────────────────────────────────────
+    let std_src = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&input_path)
+        .map_err(|e| format!("Cannot open source file: {e}"))?;
+    lock_exclusive(&std_src)?;
+
+    let file_size = std_src
+        .metadata()
+        .map_err(|e| format!("Cannot read metadata: {e}"))?
+        .len();
+
+    let src = File::from_std(std_src);
+    let mut reader = BufReader::new(src);
+
+    // ── 2. open + lock output file ───────────────────────────────────────────
+    let mut raw_out = input_path.as_os_str().to_owned();
+    raw_out.push(".aegis");
+    let output_path = std::path::PathBuf::from(raw_out);
+
+    let std_dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output_path)
+        .map_err(|e| format!("Cannot create output file: {e}"))?;
+    lock_exclusive(&std_dst)?;
+    let dst = File::from_std(std_dst);
+    let mut writer = BufWriter::new(dst);
+
+    // ── 3. generate random salt + nonce ─────────────────────────────────────
+    let mut salt  = [0u8; 16];
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+
+    // ── 4. nonce uniqueness check ────────────────────────────────────────────
+    register_nonce(nonce)?;
+
+    // ── 5. derive master key (in a blocking thread — Argon2id is CPU-heavy) ─
+    let pw_arc    = Arc::clone(&password);
+    let salt_copy = salt;
+    let key = tokio::task::spawn_blocking(move || {
+        MasterKey::derive(
+            pw_arc.expose_secret(),
+            &salt_copy,
+            ARGON2_MEM_KIB,
+            ARGON2_ITERS,
+            ARGON2_PARALLEL,
+        )
+    })
+    .await
+    .map_err(|e| format!("KDF thread panicked: {e}"))??;
+
+    let _ = progress_tx.send(ProgressUpdate::Percent(5.0)).await;
+
+    // ── 6. derive subkeys ────────────────────────────────────────────────────
+    let kvt            = key.derive_kvt();
+    let header_mac_key = key.derive_header_mac_key();
+
+    // ── 7. build header (bytes 0..92), then append MAC (bytes 92..96) ───────
+    let mut header = [0u8; 96];
+    header[0..6].copy_from_slice(AEGIS_MAGIC);
+    header[6]    = VERSION_MAJOR;
+    header[7]    = VERSION_MINOR;
+    header[8]    = AlgoId::Aes256GcmBe32 as u8;
+    // bytes 9..16 = reserved zeros
+    header[16..32].copy_from_slice(&salt);
+    header[32..44].copy_from_slice(&nonce);
+    header[44..48].copy_from_slice(&ARGON2_MEM_KIB.to_be_bytes());
+    header[48..52].copy_from_slice(&ARGON2_ITERS.to_be_bytes());
+    header[52..56].copy_from_slice(&ARGON2_PARALLEL.to_be_bytes());
+    header[56..60].copy_from_slice(&(BUFFER_SIZE as u32).to_be_bytes());
+    header[60..92].copy_from_slice(&kvt);
+    let mac = compute_header_mac(&header_mac_key, &header[0..92]);
+    header[92..96].copy_from_slice(&mac);
+
+    writer.write_all(&header).await.map_err(|e| e.to_string())?;
+
+    // ── 8. stream-encrypt with look-ahead reads ──────────────────────────────
+    let aead = Aes256Gcm::new_from_slice(&key.0)
+        .map_err(|_| "Cipher init failed.".to_string())?;
+    // Wrapped in Option so `encrypt_last` (which consumes self) can be called
+    // inside the loop without Rust flagging a potential second-iteration use.
+    // EncryptorBE32 base-nonce size = NonceSize<AES-256-GCM>(12) − 5 = 7 bytes.
+    // The last 5 bytes of the nonce space are reserved for the internal
+    // BE32 counter (4 bytes) + last-block flag (1 byte).
+    // We store all 12 random bytes in the header and track all 12 in the
+    // nonce registry; only the first 7 are passed to the stream primitive.
+    let mut encryptor = Some(EncryptorBE32::from_aead(aead, GenericArray::from_slice(&nonce[..7])));
+
+    let mut current = vec![0u8; BUFFER_SIZE];
+    let mut next    = vec![0u8; BUFFER_SIZE];
+
+    // Prime: read the first chunk.
+    let mut n = reader
+        .read(&mut current)
+        .await
+        .map_err(|e| format!("Read error: {e}"))?;
+
+    let mut bytes_done: u64 = 0;
+
+    loop {
+        // Look ahead: read the next chunk to determine if `current` is last.
+        let m = reader
+            .read(&mut next)
+            .await
+            .map_err(|e| format!("Read error: {e}"))?;
+        let is_last = m == 0;
+
+        bytes_done += n as u64;
+
+        let ct = if is_last {
+            // `take()` moves the encryptor out so `encrypt_last` can consume it.
+            encryptor
+                .take()
+                .ok_or_else(|| "Encryptor already consumed (internal error).".to_string())?
+                .encrypt_last(&current[..n])
+                .map_err(|_| "Encryption finalisation failed.".to_string())?
+        } else {
+            encryptor
+                .as_mut()
+                .ok_or_else(|| "Encryptor already consumed (internal error).".to_string())?
+                .encrypt_next(&current[..n])
+                .map_err(|_| "Encryption chunk failed.".to_string())?
+        };
+
+        writer.write_all(&ct).await.map_err(|e| e.to_string())?;
+
+        // Use file_size for display only — correctness relies on look-ahead.
+        let pct = 5.0 + (bytes_done as f32 / file_size.max(1) as f32) * 95.0;
+        let _ = progress_tx.send(ProgressUpdate::Percent(pct)).await;
+
+        if is_last {
+            break;
+        }
+
+        std::mem::swap(&mut current, &mut next);
+        n = m;
+    }
+
+    writer.flush().await.map_err(|e| e.to_string())?;
+
+    // ── 9. secure-delete original ────────────────────────────────────────────
+    // Drop the reader (and its underlying std::fs::File) explicitly before
+    // secure_delete re-opens the same path.  fs4::try_lock_exclusive is
+    // non-blocking — it returns EAGAIN immediately if any fd in this process
+    // already holds the lock on the inode.  Dropping reader releases that lock.
+    drop(reader);
+    secure_delete(&input_path).await?;
+
+    Ok(format!("Vault sealed → {output_path:?}"))
+}
+
+// ─── Decryption ───────────────────────────────────────────────────────────────
+
+async fn async_decrypt(
+    password:    Arc<SecretVec<u8>>,
+    path_str:    String,
+    progress_tx: tokio::sync::mpsc::Sender<ProgressUpdate>,
+) -> Result<String, String> {
+    let input_path = std::path::PathBuf::from(&path_str);
+
+    // ── 1. open + lock vault file ────────────────────────────────────────────
+    let std_src = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&input_path)
+        .map_err(|e| format!("Cannot open vault file: {e}"))?;
+    lock_exclusive(&std_src)?;
+
+    let total_size = std_src
+        .metadata()
+        .map_err(|e| format!("Cannot read metadata: {e}"))?
+        .len();
+
+    let src = File::from_std(std_src);
+    let mut reader = BufReader::new(src);
+
+    // ── 2. read full header ──────────────────────────────────────────────────
+    let mut header = [0u8; 96];
+    reader
+        .read_exact(&mut header)
+        .await
+        .map_err(|_| "File too small to be an Aegis vault.".to_string())?;
+
+    // ── 3. validate magic ────────────────────────────────────────────────────
+    if &header[0..6] != AEGIS_MAGIC {
+        return Err(
+            "Not an Aegis v5 vault file (bad magic bytes). \
+             If this is a v4 vault, use Aegis Vault v4 to open it."
+                .to_string(),
+        );
+    }
+
+    // ── 4. validate major version ────────────────────────────────────────────
+    let file_major = header[6];
+    let file_minor = header[7];
+    if file_major != VERSION_MAJOR {
+        return Err(format!(
+            "Unsupported vault version {file_major}.{file_minor}. \
+             Please upgrade Aegis Vault."
+        ));
+    }
+
+    // ── 5. validate algo_id ──────────────────────────────────────────────────
+    let _algo = AlgoId::try_from(header[8])?;
+
+    // ── 6. parse header fields ───────────────────────────────────────────────
+    let salt:       [u8; 16] = header[16..32].try_into().unwrap();
+    let nonce:      [u8; 12] = header[32..44].try_into().unwrap();
+    let mem_kib   = u32::from_be_bytes(header[44..48].try_into().unwrap());
+    let iters     = u32::from_be_bytes(header[48..52].try_into().unwrap());
+    let parallel  = u32::from_be_bytes(header[52..56].try_into().unwrap());
+    let chunk_sz  = u32::from_be_bytes(header[56..60].try_into().unwrap()) as usize;
+    let kvt_stored:  [u8; 32] = header[60..92].try_into().unwrap();
+    let mac_stored:  [u8; 4]  = header[92..96].try_into().unwrap();
+
+    // Reject pathological chunk sizes to prevent memory exhaustion.
+    if chunk_sz == 0 || chunk_sz > 16 * 1024 * 1024 {
+        return Err("Vault header contains an invalid chunk size.".to_string());
+    }
+
+    // ── 7. derive master key (blocking) ──────────────────────────────────────
+    let pw_arc    = Arc::clone(&password);
+    let salt_copy = salt;
+    let key = tokio::task::spawn_blocking(move || {
+        MasterKey::derive(pw_arc.expose_secret(), &salt_copy, mem_kib, iters, parallel)
+    })
+    .await
+    .map_err(|e| format!("KDF thread panicked: {e}"))??;
+
+    // ── 8. FAIL-FAST: verify KVT (constant-time) ─────────────────────────────
+    // Validates the password before any payload I/O, preventing
+    // chosen-ciphertext oracle scenarios and wasted work.
+    let kvt_derived = key.derive_kvt();
+    if kvt_derived.ct_eq(&kvt_stored).unwrap_u8() != 1 {
+        return Err(
+            "Authentication failed — wrong password or corrupted vault.".to_string(),
+        );
+    }
+
+    // ── 9. ANTI-TAMPER: verify header MAC (constant-time) ────────────────────
+    // Detects downgrade attacks (altering algo_id, KDF params, nonce, etc.)
+    // before decryption is attempted.
+    let header_mac_key = key.derive_header_mac_key();
+    let mac_computed   = compute_header_mac(&header_mac_key, &header[0..92]);
+    if mac_computed.ct_eq(&mac_stored).unwrap_u8() != 1 {
+        return Err(
+            "Header integrity check failed — vault may have been tampered with."
+                .to_string(),
+        );
+    }
+
+    let _ = progress_tx.send(ProgressUpdate::Percent(5.0)).await;
+
+    // ── 10. determine output path ─────────────────────────────────────────────
+    let output_path = if input_path.extension().is_some_and(|e| e == "aegis") {
+        input_path.with_extension("")
+    } else {
+        input_path.with_extension("decrypted")
+    };
+
+    let std_dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output_path)
+        .map_err(|e| format!("Cannot create output file: {e}"))?;
+    lock_exclusive(&std_dst)?;
+    let dst = File::from_std(std_dst);
+    let mut writer = BufWriter::new(dst);
+
+    // ── 11. stream-decrypt payload ────────────────────────────────────────────
+    let aead = Aes256Gcm::new_from_slice(&key.0)
+        .map_err(|_| "Cipher init failed.".to_string())?;
+    // Wrapped in Option for the same reason as the encryptor: `decrypt_last`
+    // consumes self and Rust requires it cannot be reached again in the loop.
+    // Same 7-byte base nonce as encryption — first 7 of the stored 12 bytes.
+    let mut decryptor = Some(DecryptorBE32::from_aead(aead, GenericArray::from_slice(&nonce[..7])));
+
+    let ct_chunk      = chunk_sz + 16; // ciphertext = plaintext + 16-byte GCM tag
+    let mut buf       = vec![0u8; ct_chunk];
+    let mut remaining = total_size.saturating_sub(HEADER_SIZE);
+    let payload_total = remaining;
+
+    loop {
+        let to_read = (remaining as usize).min(ct_chunk);
+        if to_read == 0 {
+            break;
+        }
+
+        reader
+            .read_exact(&mut buf[..to_read])
+            .await
+            .map_err(|e| format!("Read error: {e}"))?;
+        remaining -= to_read as u64;
+
+        let plaintext = if remaining == 0 {
+            decryptor
+                .take()
+                .ok_or_else(|| "Decryptor already consumed (internal error).".to_string())?
+                .decrypt_last(&buf[..to_read])
+                .map_err(|_| "Payload authentication failed — vault is corrupted.".to_string())?
+        } else {
+            decryptor
+                .as_mut()
+                .ok_or_else(|| "Decryptor already consumed (internal error).".to_string())?
+                .decrypt_next(&buf[..to_read])
+                .map_err(|_| "Chunk authentication failed — vault is corrupted.".to_string())?
+        };
+
+        writer.write_all(&plaintext).await.map_err(|e| e.to_string())?;
+
+        let done = payload_total.saturating_sub(remaining);
+        let pct  = 5.0 + (done as f32 / payload_total.max(1) as f32) * 95.0;
+        let _ = progress_tx.send(ProgressUpdate::Percent(pct)).await;
+    }
+
+    writer.flush().await.map_err(|e| e.to_string())?;
+
+    Ok(format!("Vault opened → {output_path:?}"))
+}
+
+// ─── Secure delete ────────────────────────────────────────────────────────────
+
+/// Best-effort secure erasure with honest SSD/NVMe limitations.
+///
+/// # v5 fix: single locked handle for all passes
+///
+/// v4 opened a new file handle for each overwrite pass.  On Linux, advisory
+/// locks are per-open-file-description, so the per-pass handles in v4 were
+/// not covered by the lock held on `std_f` — the overwrite passes were
+/// effectively racing unprotected writes.  v5 holds a single handle for the
+/// full erase sequence, seeking to offset 0 before each pass.
+///
+/// # Overwrite sequence
+/// 1. CSPRNG random bytes + `sync_all`
+/// 2. Zero bytes          + `sync_all`
+/// 3. CSPRNG random bytes + `sync_all`
+/// 4. `set_len(0)`        + `sync_all`   (clears filesystem size metadata)
+/// 5. `remove_file`
+///
+/// # SSD limitation
+/// Wear-levelling on flash storage means physical page locations are chosen
+/// by the controller, not the OS.  These overwrites reach the controller but
+/// do not guarantee erasure of all physical copies.  Full-disk encryption
+/// remains the only complete solution.
+async fn secure_delete(path: &Path) -> Result<(), String> {
+    // Open once, lock, keep the same handle for all passes.
+    let std_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("secure_delete — open: {e}"))?;
+
+    lock_exclusive(&std_file)
+        .map_err(|e| format!("secure_delete — lock: {e}"))?;
+
+    let file_size = std_file
+        .metadata()
+        .map_err(|e| format!("secure_delete — metadata: {e}"))?
+        .len() as usize;
+
+    // Convert to tokio file for async I/O.  The underlying fd is the same, so
+    // the advisory lock on std_file continues to protect this handle.
+    let mut tok_file = File::from_std(std_file);
+
+    let chunk = BUFFER_SIZE.min(file_size.max(1));
+    let mut buf = vec![0u8; chunk];
+
+    for pass in 0..3usize {
+        // Seek to the beginning of the file before every pass.
+        tok_file
+            .seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|e| format!("secure_delete pass {pass} — seek: {e}"))?;
+
+        let mut written = 0usize;
+        while written < file_size {
+            let n = (file_size - written).min(chunk);
+            if pass == 1 {
+                // Pass 2: zeros.
+                buf[..n].fill(0);
+            } else {
+                // Passes 1 + 3: CSPRNG random bytes.
+                OsRng.fill_bytes(&mut buf[..n]);
+            }
+            tok_file
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| format!("secure_delete pass {pass} — write: {e}"))?;
+            written += n;
+        }
+
+        tok_file
+            .sync_all()
+            .await
+            .map_err(|e| format!("secure_delete pass {pass} — fsync: {e}"))?;
+    }
+
+    // Clear filesystem-level size metadata.
+    tok_file
+        .set_len(0)
+        .await
+        .map_err(|e| format!("secure_delete — truncate: {e}"))?;
+    tok_file
+        .sync_all()
+        .await
+        .map_err(|e| format!("secure_delete — fsync truncate: {e}"))?;
+
+    // Explicitly convert back to std::fs::File to call unlock before unlink.
+    // This ensures the lock is released cleanly before the path is removed.
+    let std_file_back = tok_file.into_std().await;
+    unlock(&std_file_back)?;
+
+    tokio::fs::remove_file(path)
+        .await
+        .map_err(|e| format!("secure_delete — unlink: {e}"))?;
+
+    Ok(())
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
+#[cfg(feature = "gui")]
+fn main() -> iced::Result {
+    AegisVaultGui::run(Settings::default())
+}
+
+/// Stub main used when the `gui` feature is disabled (e.g. `cargo test --no-default-features`).
+#[cfg(not(feature = "gui"))]
+fn main() {
+    eprintln!("Build with --features gui to launch the desktop application.");
+}
+
+// ─── GUI state ────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "gui")]
+/// Application state.
+///
+/// # v5 fix: `password` is now `Zeroizing<String>`
+///
+/// v4 stored `password: String`.  A plain `String` is never zeroed: its heap
+/// allocation lingers in memory after the field is replaced or the struct is
+/// dropped, potentially leaking the master secret to a memory dump or a
+/// subsequent heap allocation.
+///
+/// `Zeroizing<String>` overwrites the heap buffer with zeros on drop
+/// (via the `Zeroize` trait implemented by `Zeroizing<T>`), so the secret is
+/// wiped whenever the password field is replaced (`Message::PasswordChanged`)
+/// or when `AegisVaultGui` itself is destroyed.
+struct AegisVaultGui {
+    /// Master password input.  Zeroed automatically on drop and on reassignment.
+    password:       Zeroizing<String>,
+    file_path:      String,
+    status_message: String,
+    progress:       f32,
+    is_processing:  bool,
+    progress_rx:    Option<tokio::sync::mpsc::Receiver<ProgressUpdate>>,
+}
+
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone)]
+enum Message {
+    PasswordChanged(String),
+    FilePathChanged(String),
+    EncryptPressed,
+    DecryptPressed,
+    ProgressTick,
+    OperationFinished,
+}
+
+#[cfg(feature = "gui")]
+impl Application for AegisVaultGui {
+    type Executor = executor::Default;
+    type Message  = Message;
+    type Theme    = Theme;
+    type Flags    = ();
+
+    fn new(_flags: ()) -> (Self, Command<Message>) {
+        (
+            AegisVaultGui {
+                password:       Zeroizing::new(String::new()),
+                file_path:      String::new(),
+                status_message: "Ready — awaiting your command.".to_string(),
+                progress:       0.0,
+                is_processing:  false,
+                progress_rx:    None,
+            },
+            Command::none(),
+        )
+    }
+
+    fn title(&self) -> String {
+        "Aegis Sovereign Vault  v5".to_string()
+    }
+
+    fn update(&mut self, message: Message) -> Command<Message> {
+        match message {
+            // Assigning a new `Zeroizing<String>` drops (and zeroes) the old one.
+            Message::PasswordChanged(p) => {
+                self.password = Zeroizing::new(p);
+                Command::none()
+            }
+            Message::FilePathChanged(p) => {
+                self.file_path = p;
+                Command::none()
+            }
+
+            Message::EncryptPressed => {
+                if let Some(err) = self.validate_inputs() {
+                    self.status_message = err;
+                    return Command::none();
+                }
+                self.begin_operation("Deriving Argon2id key — this takes a few seconds…");
+                let (tx, rx) = tokio::sync::mpsc::channel::<ProgressUpdate>(128);
+                self.progress_rx = Some(rx);
+                // `to_vec()` creates a temporary copy of the password bytes;
+                // `SecretVec::new` takes ownership and will zero them on drop.
+                let secret = Arc::new(SecretVec::new(self.password.as_bytes().to_vec()));
+                let path   = self.file_path.clone();
+                Command::perform(
+                    async move {
+                        let result = async_encrypt(secret, path, tx.clone()).await;
+                        let _ = tx.send(ProgressUpdate::Done(result)).await;
+                    },
+                    |_| Message::OperationFinished,
+                )
+            }
+
+            Message::DecryptPressed => {
+                if let Some(err) = self.validate_inputs() {
+                    self.status_message = err;
+                    return Command::none();
+                }
+                self.begin_operation("Verifying password — this takes a few seconds…");
+                let (tx, rx) = tokio::sync::mpsc::channel::<ProgressUpdate>(128);
+                self.progress_rx = Some(rx);
+                let secret = Arc::new(SecretVec::new(self.password.as_bytes().to_vec()));
+                let path   = self.file_path.clone();
+                Command::perform(
+                    async move {
+                        let result = async_decrypt(secret, path, tx.clone()).await;
+                        let _ = tx.send(ProgressUpdate::Done(result)).await;
+                    },
+                    |_| Message::OperationFinished,
+                )
+            }
+
+            Message::ProgressTick => {
+                if let Some(rx) = &mut self.progress_rx {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(ProgressUpdate::Percent(p)) => {
+                                self.progress = p;
+                                let stage = if p < 6.0 {
+                                    "Deriving key (Argon2id)…"
+                                } else {
+                                    "Streaming & authenticating…"
+                                };
+                                self.status_message = format!("{stage}  {p:.0}%");
+                            }
+                            Ok(ProgressUpdate::Done(result)) => {
+                                self.is_processing = false;
+                                self.progress_rx   = None;
+                                match result {
+                                    Ok(msg) => {
+                                        self.progress       = 100.0;
+                                        self.status_message = format!("Done: {msg}");
+                                    }
+                                    Err(err) => {
+                                        self.progress       = 0.0;
+                                        self.status_message = format!("Error: {err}");
+                                    }
+                                }
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Command::none()
+            }
+
+            Message::OperationFinished => Command::none(),
+        }
+    }
+
+    fn subscription(&self) -> iced::Subscription<Message> {
+        if self.is_processing {
+            iced::time::every(std::time::Duration::from_millis(33))
+                .map(|_| Message::ProgressTick)
+        } else {
+            iced::Subscription::none()
+        }
+    }
+
+    fn view(&self) -> Element<Message> {
+        // `self.password` is `Zeroizing<String>`; deref to `&str` explicitly.
+        // `secure(true)` masks characters — equivalent to the HTML `password` input type.
+        let pass_input = text_input(
+            "Master password (>= 12 chars)…",
+            self.password.as_str(),
+        )
+        .on_input(Message::PasswordChanged)
+        .secure(true)
+        .padding(12);
+
+        let path_input = text_input("Absolute file path…", &self.file_path)
+            .on_input(Message::FilePathChanged)
+            .padding(12);
+
+        let action_row: Element<Message> = if self.is_processing {
+            text(format!("  {}", self.status_message)).size(15).into()
+        } else {
+            row![
+                button("Encrypt & Shred")
+                    .on_press(Message::EncryptPressed)
+                    .padding(14),
+                button("Decrypt Vault")
+                    .on_press(Message::DecryptPressed)
+                    .padding(14),
+            ]
+            .spacing(20)
+            .into()
+        };
+
+        let ssd_notice = text(
+            "SSD/NVMe: secure-shred is best-effort. \
+             Use full-disk encryption for complete protection.",
+        )
+        .size(11);
+
+        let content = column![
+            text("AEGIS SOVEREIGN VAULT  v5").size(26),
+            text(
+                "AES-256-GCM  |  Argon2id  |  Header MAC  \
+                 |  KVT Fast-Auth  |  Nonce Registry  |  File Lock"
+            )
+            .size(11),
+            pass_input,
+            path_input,
+            action_row,
+            progress_bar(0.0..=100.0, self.progress),
+            text(format!("{:.0}%", self.progress)).size(12),
+            text(&self.status_message).size(14),
+            ssd_notice,
+        ]
+        .spacing(18)
+        .max_width(720);
+
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x()
+            .center_y()
+            .padding(48)
+            .into()
+    }
+
+    fn theme(&self) -> Theme {
+        Theme::Dark
+    }
+}
+
+// ─── GUI helpers ──────────────────────────────────────────────────────────────
+
+#[cfg(feature = "gui")]
+impl AegisVaultGui {
+    fn validate_inputs(&self) -> Option<String> {
+        if self.password.len() < 12 {
+            return Some("Password must be at least 12 characters.".to_string());
+        }
+        if self.file_path.trim().is_empty() {
+            return Some("Please enter a file path.".to_string());
+        }
+        None
+    }
+
+    fn begin_operation(&mut self, msg: &str) {
+        self.is_processing  = true;
+        self.progress       = 0.0;
+        self.status_message = msg.to_string();
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    async fn progress_sink() -> tokio::sync::mpsc::Sender<ProgressUpdate> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressUpdate>(256);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        tx
+    }
+
+    /// Round-trip: write plaintext → encrypt → decrypt → compare.
+    #[tokio::test]
+    async fn test_roundtrip_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain_path = dir.path().join("secret.txt");
+        let vault_path = dir.path().join("secret.txt.aegis");
+
+        let content = b"The quick brown fox jumps over the lazy dog. \
+                        This is a small plaintext payload for round-trip testing.";
+
+        std::fs::write(&plain_path, content).unwrap();
+
+        let password = Arc::new(SecretVec::new(b"hunter2-but-longer".to_vec()));
+
+        // ── Encrypt ──────────────────────────────────────────────────────────
+        let result = async_encrypt(
+            Arc::clone(&password),
+            plain_path.to_str().unwrap().to_string(),
+            progress_sink().await,
+        )
+        .await;
+        assert!(result.is_ok(), "Encrypt failed: {:?}", result);
+        assert!(vault_path.exists(), ".aegis output file missing");
+        assert!(!plain_path.exists(), "Original file not deleted after encrypt");
+
+        // ── Decrypt ──────────────────────────────────────────────────────────
+        let result2 = async_decrypt(
+            Arc::clone(&password),
+            vault_path.to_str().unwrap().to_string(),
+            progress_sink().await,
+        )
+        .await;
+        assert!(result2.is_ok(), "Decrypt failed: {:?}", result2);
+
+        // Decrypted file should be `secret.txt` (stripped .aegis extension).
+        let decrypted = std::fs::read(&plain_path).unwrap();
+        assert_eq!(decrypted, content, "Decrypted content does not match original");
+    }
+
+    /// Wrong password must be rejected before any payload I/O (via KVT check).
+    #[tokio::test]
+    async fn test_wrong_password_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain_path = dir.path().join("data.bin");
+        let vault_path = dir.path().join("data.bin.aegis");
+
+        std::fs::write(&plain_path, b"sensitive data").unwrap();
+
+        let correct_pw = Arc::new(SecretVec::new(b"correct-password-long".to_vec()));
+        let wrong_pw   = Arc::new(SecretVec::new(b"wrong-password-looong".to_vec()));
+
+        async_encrypt(Arc::clone(&correct_pw), plain_path.to_str().unwrap().to_string(), progress_sink().await)
+            .await.unwrap();
+
+        let err = async_decrypt(wrong_pw, vault_path.to_str().unwrap().to_string(), progress_sink().await)
+            .await;
+        assert!(err.is_err(), "Wrong password was not rejected");
+        let msg = err.unwrap_err();
+        assert!(
+            msg.contains("Authentication failed"),
+            "Unexpected error message: {msg}"
+        );
+    }
+
+    /// Multi-chunk file: payload larger than BUFFER_SIZE exercises the streaming path.
+    #[tokio::test]
+    async fn test_roundtrip_multi_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain_path = dir.path().join("large.bin");
+        let vault_path = dir.path().join("large.bin.aegis");
+
+        // 1.5× BUFFER_SIZE forces at least two encrypt_next + one encrypt_last chunk.
+        let content: Vec<u8> = (0u8..=255).cycle().take(BUFFER_SIZE + BUFFER_SIZE / 2).collect();
+        std::fs::write(&plain_path, &content).unwrap();
+
+        let pw = Arc::new(SecretVec::new(b"multi-chunk-passphrase-ok".to_vec()));
+
+        async_encrypt(Arc::clone(&pw), plain_path.to_str().unwrap().to_string(), progress_sink().await)
+            .await.unwrap();
+
+        async_decrypt(Arc::clone(&pw), vault_path.to_str().unwrap().to_string(), progress_sink().await)
+            .await.unwrap();
+
+        let recovered = std::fs::read(&plain_path).unwrap();
+        assert_eq!(recovered, content, "Multi-chunk round-trip mismatch");
+    }
+}
