@@ -1,0 +1,439 @@
+// =============================================================================
+//  AEGIS SOVEREIGN VAULT — v8.1  |  CRYPTO CORE
+// =============================================================================
+
+#![allow(dead_code)]
+
+use aes_gcm::{
+    aead::{generic_array::GenericArray, stream::{DecryptorBE32, EncryptorBE32}},
+    Aes256Gcm, KeyInit, Nonce,
+};
+use aes_gcm_siv::Aes256GcmSiv;
+use argon2::{Argon2, Params as Argon2Params, Version as Argon2Version};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use rand::{rngs::OsRng, rngs::StdRng, RngCore, SeedableRng};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use secrecy::{ExposeSecret, SecretVec};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use fs4::tokio::AsyncFileExt;
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter},
+};
+use serde::{Deserialize, Serialize};
+use tracing::{info, instrument};
+use vsss_rs::shamir;
+use qr_code::QrCode;
+use dashmap::DashSet;
+use std::{
+    io::SeekFrom,
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use once_cell::sync::Lazy;
+
+// =============================================================================
+//  CONSTANTS
+// =============================================================================
+
+pub const VERSION_MAJOR: u16 = 8;
+pub const VERSION_MINOR: u16 = 1;
+pub const MAGIC_BYTES: &[u8; 6] = b"AEGIS8";
+pub const HEADER_SIZE: u64 = 200;
+pub const BUFFER_SIZE: usize = 512 * 1024;
+pub const SALT_SIZE: usize = 32;
+pub const NONCE_SIZE: usize = 12;
+pub const KVT_SIZE: usize = 32;
+pub const HEADER_MAC_SIZE: usize = 32;
+pub const ARGON2_OUTPUT_LEN: usize = 64;
+pub const ARGON2_MEM_KIB: u32 = 128 * 1024;
+pub const ARGON2_ITERS: u32 = 4;
+pub const ARGON2_PARALLEL: u32 = 4;
+pub const MAX_ARGON2_MEM_KIB: u32 = 4 * 1024 * 1024;
+pub const MAX_ARGON2_ITERS: u32 = 64;
+pub const MAX_ARGON2_PARALLEL: u32 = 64;
+pub const SHAMIR_TOTAL: usize = 5;
+pub const SHAMIR_THRESHOLD: usize = 3;
+pub const MAX_FILE_SIZE: u64 = 1_099_511_627_776;
+
+pub const KVT_INFO: &[u8] = b"aegis-kvt-v8";
+pub const HEADER_MAC_INFO: &[u8] = b"aegis-header-mac-v8";
+pub const ENC_KEY_INFO: &[u8] = b"aegis-enc-key-v8";
+pub const HMAC_KEY_INFO: &[u8] = b"aegis-hmac-key-v8";
+pub const AUDIT_KEY_INFO: &[u8] = b"aegis-audit-key-v8";
+pub const RECOVERY_KEY_INFO: &[u8] = b"aegis-recovery-key-v8";
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub static AUDIT_LOG_PATH: Lazy<String> = Lazy::new(|| {
+    std::env::var("AEGIS_AUDIT_PATH").unwrap_or_else(|_| "aegis_audit.enc".to_string())
+});
+
+// =============================================================================
+//  NONCE REGISTRY
+// =============================================================================
+
+static NONCE_REGISTRY: OnceLock<DashSet<[u8; 12]>> = OnceLock::new();
+
+pub fn nonce_registry() -> &'static DashSet<[u8; 12]> {
+    NONCE_REGISTRY.get_or_init(DashSet::new)
+}
+
+pub fn register_nonce(nonce: [u8; 12]) -> Result<(), AegisError> {
+    if !nonce_registry().insert(nonce) {
+        return Err(AegisError::NonceCollision);
+    }
+    Ok(())
+}
+
+// =============================================================================
+//  ERROR TYPE
+// =============================================================================
+
+#[derive(Debug)]
+pub enum AegisError {
+    Io(String), Crypto(String), Kdf(String), Header(String),
+    Auth, Tamper, NonceCollision, TooLarge, InvalidParam(String),
+    Shamir(String), Audit(String),
+}
+
+impl std::fmt::Display for AegisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AegisError::Io(s) => write!(f, "I/O error: {s}"),
+            AegisError::Crypto(s) => write!(f, "Crypto error: {s}"),
+            AegisError::Kdf(s) => write!(f, "KDF error: {s}"),
+            AegisError::Header(s) => write!(f, "Header error: {s}"),
+            AegisError::Auth => write!(f, "Wrong password or corrupted vault."),
+            AegisError::Tamper => write!(f, "Header integrity check failed."),
+            AegisError::NonceCollision => write!(f, "Nonce collision - RNG failure."),
+            AegisError::TooLarge => write!(f, "File exceeds 1 TiB limit."),
+            AegisError::InvalidParam(s) => write!(f, "Invalid param: {s}"),
+            AegisError::Shamir(s) => write!(f, "Shamir error: {s}"),
+            AegisError::Audit(s) => write!(f, "Audit error: {s}"),
+        }
+    }
+}
+
+// =============================================================================
+//  MASTER KEY
+// =============================================================================
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct MasterKey {
+    pub encryption_key: [u8; 32],
+    pub hmac_key: [u8; 32],
+    pub audit_key: [u8; 32],
+    pub kvt: [u8; 32],
+    pub header_mac_key: [u8; 32],
+    pub recovery_key: [u8; 32],
+}
+
+impl MasterKey {
+    pub fn derive(password: &[u8], salt: &[u8; SALT_SIZE], mem_kib: u32, iters: u32, parallel: u32) -> Result<Self, AegisError> {
+        let params = Argon2Params::new(mem_kib, iters, parallel, Some(ARGON2_OUTPUT_LEN))
+            .map_err(|e| AegisError::Kdf(e.to_string()))?;
+        let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Argon2Version::V0x13, params);
+        let mut ikm = vec![0u8; ARGON2_OUTPUT_LEN];
+        argon2.hash_password_into(password, salt, &mut ikm).map_err(|e| AegisError::Kdf(e.to_string()))?;
+        let hk = Hkdf::<Sha256>::new(None, &ikm);
+        ikm.zeroize();
+        let mut mk = MasterKey {
+            encryption_key: [0u8; 32], hmac_key: [0u8; 32], audit_key: [0u8; 32],
+            kvt: [0u8; 32], header_mac_key: [0u8; 32], recovery_key: [0u8; 32],
+        };
+        hk.expand(ENC_KEY_INFO, &mut mk.encryption_key).map_err(|_| AegisError::Kdf("enc_key".into()))?;
+        hk.expand(HMAC_KEY_INFO, &mut mk.hmac_key).map_err(|_| AegisError::Kdf("hmac_key".into()))?;
+        hk.expand(AUDIT_KEY_INFO, &mut mk.audit_key).map_err(|_| AegisError::Kdf("audit_key".into()))?;
+        hk.expand(KVT_INFO, &mut mk.kvt).map_err(|_| AegisError::Kdf("kvt".into()))?;
+        hk.expand(HEADER_MAC_INFO, &mut mk.header_mac_key).map_err(|_| AegisError::Kdf("header_mac".into()))?;
+        hk.expand(RECOVERY_KEY_INFO, &mut mk.recovery_key).map_err(|_| AegisError::Kdf("recovery_key".into()))?;
+        Ok(mk)
+    }
+}
+
+pub fn compute_header_mac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC");
+    mac.update(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&mac.finalize().into_bytes());
+    out
+}
+
+// =============================================================================
+//  SHAMIR SECRET SHARING
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryShare {
+    pub index: usize,
+    pub share_hex: String,
+    pub qr_code_ascii: String,
+    pub created_at: u64,
+}
+
+pub fn generate_recovery_shares(recovery_key: &[u8; 32]) -> Result<Vec<RecoveryShare>, AegisError> {
+    let mut rng = StdRng::from_entropy();
+    let shares = shamir::split_secret::<u8, StdRng>(SHAMIR_THRESHOLD as u8, SHAMIR_TOTAL as u8, recovery_key, &mut rng)
+        .map_err(|e| AegisError::Shamir(format!("{e:?}")))?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut result = Vec::with_capacity(SHAMIR_TOTAL);
+    for (i, share) in shares.into_iter().enumerate() {
+        let share_hex = hex::encode(&share);
+        let qr_ascii = QrCode::new(&share_hex).map(|q| q.to_string(true)).unwrap_or_else(|_| share_hex.clone());
+        result.push(RecoveryShare { index: i + 1, share_hex, qr_code_ascii: qr_ascii, created_at: now });
+    }
+    Ok(result)
+}
+
+pub fn recover_key_from_shares(shares: &[RecoveryShare]) -> Result<[u8; 32], AegisError> {
+    if shares.len() < SHAMIR_THRESHOLD {
+        return Err(AegisError::Shamir(format!("Need at least {SHAMIR_THRESHOLD} shares")));
+    }
+    let raw: Vec<Vec<u8>> = shares.iter().map(|s| hex::decode(&s.share_hex).map_err(|e| AegisError::Shamir(e.to_string()))).collect::<Result<_, _>>()?;
+    let recovered = shamir::combine_shares::<u8>(&raw).map_err(|e| AegisError::Shamir(format!("{e:?}")))?;
+    let mut key = [0u8; 32];
+    if recovered.len() != 32 { return Err(AegisError::Shamir("Wrong length".into())); }
+    key.copy_from_slice(&recovered);
+    Ok(key)
+}
+
+// =============================================================================
+//  ENCRYPTED AUDIT LOG
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry { pub timestamp: u64, pub operation: String, pub file_path: String, pub file_hash: String, pub file_size: u64, pub status: String }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EncryptedAuditRecord { ciphertext: Vec<u8>, nonce: [u8; 12], mac: String }
+
+impl AuditEntry {
+    fn encrypt(&self, audit_key: &[u8; 32]) -> Result<EncryptedAuditRecord, AegisError> {
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let data = serde_json::to_vec(self).map_err(|e| AegisError::Audit(e.to_string()))?;
+        let cipher = Aes256GcmSiv::new_from_slice(audit_key).map_err(|_| AegisError::Audit("Cipher init".into()))?;
+        let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), data.as_ref()).map_err(|e| AegisError::Audit(e.to_string()))?;
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(audit_key).map_err(|_| AegisError::Audit("HMAC init".into()))?;
+        mac.update(&ct);
+        mac.update(&nonce_bytes);
+        let mac_hex = hex::encode(mac.finalize().into_bytes());
+        Ok(EncryptedAuditRecord { ciphertext: ct, nonce: nonce_bytes, mac: mac_hex })
+    }
+}
+
+pub async fn append_audit(entry: &AuditEntry, audit_key: &[u8; 32]) -> Result<(), AegisError> {
+    let record = entry.encrypt(audit_key)?;
+    let line = serde_json::to_string(&record).map_err(|e| AegisError::Audit(e.to_string()))?;
+    let mut f = OpenOptions::new().create(true).append(true).open(AUDIT_LOG_PATH.as_str()).await.map_err(|e| AegisError::Audit(e.to_string()))?;
+    f.write_all(line.as_bytes()).await.map_err(|e| AegisError::Audit(e.to_string()))?;
+    f.write_all(b"\n").await.map_err(|e| AegisError::Audit(e.to_string()))?;
+    Ok(())
+}
+
+// =============================================================================
+//  FILE UTILITIES
+// =============================================================================
+
+pub async fn compute_file_hash(path: &Path) -> Result<String, AegisError> {
+    let mut file = File::open(path).await.map_err(|e| AegisError::Io(e.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; BUFFER_SIZE];
+    loop {
+        let n = file.read(&mut buf).await.map_err(|e| AegisError::Io(e.to_string()))?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+pub async fn secure_delete(path: &Path) -> Result<(), AegisError> {
+    let size = tokio::fs::metadata(path).await.map_err(|e| AegisError::Io(e.to_string()))?.len() as usize;
+    let mut f = OpenOptions::new().write(true).open(path).await.map_err(|e| AegisError::Io(e.to_string()))?;
+    f.lock_exclusive().await.map_err(|e| AegisError::Io(e.to_string()))?;
+    let chunk = BUFFER_SIZE.min(size.max(1));
+    let mut buf = vec![0u8; chunk];
+    let pass_random = [true, false, false, false, false, false, true];
+    let patterns: [u8; 7] = [0xFF, 0x00, 0x55, 0xAA, 0x92, 0x49, 0x24];
+    for pass in 0..7usize {
+        f.seek(SeekFrom::Start(0)).await.map_err(|e| AegisError::Io(format!("seek {pass}: {e}")))?;
+        let mut written = 0usize;
+        while written < size {
+            let n = (size - written).min(chunk);
+            if pass_random[pass] { OsRng.fill_bytes(&mut buf[..n]); } else { buf[..n].fill(patterns[pass]); }
+            f.write_all(&buf[..n]).await.map_err(|e| AegisError::Io(format!("write {pass}: {e}")))?;
+            written += n;
+        }
+        f.sync_all().await.map_err(|e| AegisError::Io(format!("sync {pass}: {e}")))?;
+    }
+    f.set_len(0).await.map_err(|e| AegisError::Io(format!("truncate: {e}")))?;
+    f.sync_all().await.map_err(|e| AegisError::Io("fsync truncate".into()))?;
+    drop(f);
+    tokio::fs::remove_file(path).await.map_err(|e| AegisError::Io(e.to_string()))?;
+    Ok(())
+}
+
+pub fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+// =============================================================================
+//  ENCRYPTION
+// =============================================================================
+
+#[instrument(skip(password))]
+pub async fn async_encrypt(
+    password: Arc<SecretVec<u8>>,
+    input_path: String,
+    shred_after: bool,
+) -> Result<(String, Vec<RecoveryShare>, String), AegisError> {
+    let in_path = PathBuf::from(&input_path);
+    if !in_path.exists() { return Err(AegisError::Io("File not found".into())); }
+    let file_size = tokio::fs::metadata(&in_path).await.map_err(|e| AegisError::Io(e.to_string()))?.len();
+    if file_size > MAX_FILE_SIZE { return Err(AegisError::TooLarge); }
+    let file_hash = compute_file_hash(&in_path).await?;
+    let out_path = in_path.with_extension("aegis");
+    let mut salt = [0u8; SALT_SIZE];
+    let mut nonce = [0u8; NONCE_SIZE];
+    let mut recovery_salt = [0u8; SALT_SIZE];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+    OsRng.fill_bytes(&mut recovery_salt);
+    register_nonce(nonce)?;
+    
+    let pw_ref = password.clone();
+    let salt_copy = salt;
+    let master_key = tokio::task::spawn_blocking(move || {
+        MasterKey::derive(pw_ref.expose_secret(), &salt_copy, ARGON2_MEM_KIB, ARGON2_ITERS, ARGON2_PARALLEL)
+    }).await.map_err(|e| AegisError::Kdf(format!("KDF panic: {e}")))??;
+    
+    let shares = generate_recovery_shares(&master_key.recovery_key)?;
+    let timestamp = unix_now();
+    let mut header = [0u8; 200];
+    header[0..6].copy_from_slice(MAGIC_BYTES);
+    header[6..8].copy_from_slice(&VERSION_MAJOR.to_be_bytes());
+    header[8..10].copy_from_slice(&VERSION_MINOR.to_be_bytes());
+    header[10] = 0x01;
+    header[16..48].copy_from_slice(&salt);
+    header[48..60].copy_from_slice(&nonce);
+    header[60..64].copy_from_slice(&ARGON2_MEM_KIB.to_be_bytes());
+    header[64..68].copy_from_slice(&ARGON2_ITERS.to_be_bytes());
+    header[68..72].copy_from_slice(&ARGON2_PARALLEL.to_be_bytes());
+    header[72..76].copy_from_slice(&(BUFFER_SIZE as u32).to_be_bytes());
+    header[76..84].copy_from_slice(&timestamp.to_be_bytes());
+    header[84..116].copy_from_slice(&recovery_salt);
+    header[116..148].copy_from_slice(&master_key.kvt);
+    header[148..150].copy_from_slice(&(SHAMIR_THRESHOLD as u16).to_be_bytes());
+    header[150..152].copy_from_slice(&(SHAMIR_TOTAL as u16).to_be_bytes());
+    let mac = compute_header_mac(&master_key.header_mac_key, &header[0..168]);
+    header[168..200].copy_from_slice(&mac);
+    
+    let std_src = std::fs::OpenOptions::new().read(true).open(&in_path).map_err(|e| AegisError::Io(format!("open: {e}")))?;
+    fs4::FileExt::try_lock_exclusive(&std_src).map_err(|e| AegisError::Io(format!("lock: {e}")))?;
+    let std_dst = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&out_path).map_err(|e| AegisError::Io(format!("create: {e}")))?;
+    fs4::FileExt::try_lock_exclusive(&std_dst).map_err(|e| AegisError::Io(format!("lock: {e}")))?;
+    let src_tok = File::from_std(std_src);
+    let dst_tok = File::from_std(std_dst);
+    let mut reader = BufReader::new(src_tok);
+    let mut writer = BufWriter::new(dst_tok);
+    writer.write_all(&header).await.map_err(|e| AegisError::Io(e.to_string()))?;
+    
+    let aead = Aes256Gcm::new_from_slice(&master_key.encryption_key).map_err(|_| AegisError::Crypto("cipher init".into()))?;
+    let mut encryptor = Some(EncryptorBE32::from_aead(aead, GenericArray::from_slice(&nonce[..7])));
+    let mut current = vec![0u8; BUFFER_SIZE];
+    let mut next_chunk = vec![0u8; BUFFER_SIZE];
+    let mut n = reader.read(&mut current).await.map_err(|e| AegisError::Io(e.to_string()))?;
+    let mut bytes_done: u64 = 0;
+    loop {
+        let m = reader.read(&mut next_chunk).await.map_err(|e| AegisError::Io(e.to_string()))?;
+        let is_last = m == 0;
+        bytes_done += n as u64;
+        let ct = if is_last {
+            encryptor.take().ok_or_else(|| AegisError::Crypto("encryptor consumed".into()))?.encrypt_last(&current[..n]).map_err(|_| AegisError::Crypto("encrypt_last failed".into()))?
+        } else {
+            encryptor.as_mut().ok_or_else(|| AegisError::Crypto("encryptor consumed".into()))?.encrypt_next(&current[..n]).map_err(|_| AegisError::Crypto("encrypt_next failed".into()))?
+        };
+        writer.write_all(&ct).await.map_err(|e| AegisError::Io(e.to_string()))?;
+        if is_last { break; }
+        std::mem::swap(&mut current, &mut next_chunk);
+        n = m;
+    }
+    writer.flush().await.map_err(|e| AegisError::Io(e.to_string()))?;
+    drop(reader);
+    if shred_after { secure_delete(&in_path).await?; }
+    let _ = append_audit(&AuditEntry { timestamp: unix_now(), operation: "ENCRYPT".into(), file_path: input_path.clone(), file_hash, file_size, status: "SUCCESS".into() }, &master_key.audit_key).await;
+    let audit_prefix = hex::encode(&master_key.audit_key[..16]);
+    let out_name = out_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| out_path.display().to_string());
+    Ok((format!("Encrypted → {out_name}"), shares, audit_prefix))
+}
+
+// =============================================================================
+//  DECRYPTION
+// =============================================================================
+
+#[instrument(skip(password))]
+pub async fn async_decrypt(password: Arc<SecretVec<u8>>, input_path: String) -> Result<String, AegisError> {
+    let in_path = PathBuf::from(&input_path);
+    if !in_path.exists() { return Err(AegisError::Io("Vault not found".into())); }
+    let out_path = in_path.with_extension("");
+    let std_src = std::fs::OpenOptions::new().read(true).open(&in_path).map_err(|e| AegisError::Io(format!("open: {e}")))?;
+    fs4::FileExt::try_lock_exclusive(&std_src).map_err(|e| AegisError::Io(format!("lock: {e}")))?;
+    let total_size = std_src.metadata().map_err(|e| AegisError::Io(e.to_string()))?.len();
+    let src_tok = File::from_std(std_src);
+    let mut reader = BufReader::new(src_tok);
+    let mut header = [0u8; 200];
+    reader.read_exact(&mut header).await.map_err(|_| AegisError::Header("too small".into()))?;
+    if &header[0..6] != MAGIC_BYTES { return Err(AegisError::Header("bad magic".into())); }
+    let file_major = u16::from_be_bytes(header[6..8].try_into().unwrap());
+    if file_major != VERSION_MAJOR { return Err(AegisError::Header("version mismatch".into())); }
+    let salt: [u8; SALT_SIZE] = header[16..48].try_into().unwrap();
+    let nonce: [u8; NONCE_SIZE] = header[48..60].try_into().unwrap();
+    let mem_kib = u32::from_be_bytes(header[60..64].try_into().unwrap());
+    let iters = u32::from_be_bytes(header[64..68].try_into().unwrap());
+    let parallel = u32::from_be_bytes(header[68..72].try_into().unwrap());
+    let chunk_sz = u32::from_be_bytes(header[72..76].try_into().unwrap()) as usize;
+    let kvt_stored: [u8; 32] = header[116..148].try_into().unwrap();
+    let mac_stored: [u8; 32] = header[168..200].try_into().unwrap();
+    if mem_kib > MAX_ARGON2_MEM_KIB || iters > MAX_ARGON2_ITERS || parallel > MAX_ARGON2_PARALLEL {
+        return Err(AegisError::InvalidParam("KDF param too large".into()));
+    }
+    let pw_ref = password.clone();
+    let salt_copy = salt;
+    let master_key = tokio::task::spawn_blocking(move || {
+        MasterKey::derive(pw_ref.expose_secret(), &salt_copy, mem_kib, iters, parallel)
+    }).await.map_err(|e| AegisError::Kdf(format!("KDF panic: {e}")))??;
+    if master_key.ct_eq(&kvt_stored).unwrap_u8() != 1 { return Err(AegisError::Auth); }
+    let mac_computed = compute_header_mac(&master_key.header_mac_key, &header[0..168]);
+    if mac_computed.ct_eq(&mac_stored).unwrap_u8() != 1 { return Err(AegisError::Tamper); }
+    let std_dst = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&out_path).map_err(|e| AegisError::Io(format!("create: {e}")))?;
+    fs4::FileExt::try_lock_exclusive(&std_dst).map_err(|e| AegisError::Io(format!("lock: {e}")))?;
+    let dst_tok = File::from_std(std_dst);
+    let mut writer = BufWriter::new(dst_tok);
+    let aead = Aes256Gcm::new_from_slice(&master_key.encryption_key).map_err(|_| AegisError::Crypto("cipher init".into()))?;
+    let mut decryptor = Some(DecryptorBE32::from_aead(aead, GenericArray::from_slice(&nonce[..7])));
+    let ct_chunk = chunk_sz + 16;
+    let mut buf = vec![0u8; ct_chunk];
+    let mut remaining = total_size.saturating_sub(HEADER_SIZE);
+    loop {
+        let to_read = (remaining as usize).min(ct_chunk);
+        if to_read == 0 { break; }
+        reader.read_exact(&mut buf[..to_read]).await.map_err(|e| AegisError::Io(e.to_string()))?;
+        remaining -= to_read as u64;
+        let pt = if remaining == 0 {
+            decryptor.take().ok_or_else(|| AegisError::Crypto("decryptor consumed".into()))?.decrypt_last(&buf[..to_read]).map_err(|_| AegisError::Crypto("auth failed".into()))?
+        } else {
+            decryptor.as_mut().ok_or_else(|| AegisError::Crypto("decryptor consumed".into()))?.decrypt_next(&buf[..to_read]).map_err(|_| AegisError::Crypto("chunk failed".into()))?
+        };
+        writer.write_all(&pt).await.map_err(|e| AegisError::Io(e.to_string()))?;
+    }
+    writer.flush().await.map_err(|e| AegisError::Io(e.to_string()))?;
+    let file_size = tokio::fs::metadata(&out_path).await.map(|m| m.len()).unwrap_or(0);
+    let file_hash = compute_file_hash(&out_path).await.unwrap_or_default();
+    let _ = append_audit(&AuditEntry { timestamp: unix_now(), operation: "DECRYPT".into(), file_path: input_path, file_hash, file_size, status: "SUCCESS".into() }, &master_key.audit_key).await;
+    let out_name = out_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| out_path.display().to_string());
+    Ok(format!("Vault opened → {out_name}"))
+}

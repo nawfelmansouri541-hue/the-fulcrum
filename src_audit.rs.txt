@@ -1,0 +1,70 @@
+// =============================================================================
+//  AEGIS SOVEREIGN VAULT — v8.2  |  AUDIT MANAGEMENT
+// =============================================================================
+
+use crate::crypto::*;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhysicalAuditEntry {
+    pub timestamp: u64,
+    pub operation: PhysicalOperation,
+    pub media_id: String,
+    pub client_id: String,
+    pub operator_id: String,
+    pub location: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PhysicalOperation {
+    Receive,
+    Store,
+    Retrieve,
+    Ship,
+    Destroy,
+}
+
+pub async fn log_physical_operation(
+    entry: PhysicalAuditEntry,
+    audit_key: &[u8; 32],
+) -> Result<(), AegisError> {
+    let data = serde_json::to_vec(&entry).map_err(|e| AegisError::Audit(e.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    let hash = hex::encode(hasher.finalize());
+    
+    let audit_entry = AuditEntry {
+        timestamp: entry.timestamp,
+        operation: format!("PHYSICAL_{:?}", entry.operation),
+        file_path: format!("Media: {}", entry.media_id),
+        file_hash: hash,
+        file_size: 0,
+        status: "SUCCESS".to_string(),
+    };
+    
+    append_audit(&audit_entry, audit_key).await
+}
+
+pub async fn generate_client_report(
+    client_id: &str,
+    start_date: u64,
+    end_date: u64,
+    audit_key: &[u8; 32],
+) -> Result<String, AegisError> {
+    let content = tokio::fs::read_to_string(AUDIT_LOG_PATH.as_str())
+        .await
+        .map_err(|e| AegisError::Audit(e.to_string()))?;
+    
+    let mut report = Vec::new();
+    report.push(format!("Audit Report for client: {}", client_id));
+    report.push(format!("Period: {} - {}", start_date, end_date));
+    report.push("─────────────────────────────────────────────".to_string());
+    
+    for line in content.lines() {
+        report.push(line.to_string());
+    }
+    
+    Ok(report.join("\n"))
+}

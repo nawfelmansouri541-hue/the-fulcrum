@@ -1,0 +1,10 @@
+// =============================================================================
+//  AEGIS SOVEREIGN VAULT — v8.2  |  CORE LIBRARY
+// =============================================================================
+
+pub mod crypto;
+pub mod audit;
+pub mod lto;
+
+pub use crypto::*;
+pub use audit::*;

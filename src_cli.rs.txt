@@ -1,0 +1,152 @@
+// =============================================================================
+//  AEGIS SOVEREIGN VAULT — v8.2  |  CLI INTERFACE
+// =============================================================================
+
+use aegis_vault::crypto::*;
+use aegis_vault::lto::LtoTape;
+use aegis_vault::audit::*;
+use clap::{Parser, Subcommand};
+use secrecy::SecretVec;
+use std::sync::Arc;
+use zeroize::Zeroizing;
+
+#[derive(Parser)]
+#[command(name = "aegis-cli")]
+#[command(about = "Aegis Sovereign Vault - CLI for The Fulcrum")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Encrypt { input: String, shred: bool, password: Option<String> },
+    Decrypt { input: String, password: Option<String> },
+    Verify { input: String },
+    LtoWrite { input: String, device: String, password: Option<String> },
+    LtoRead { output: String, device: String, password: Option<String> },
+    Log { media_id: String, client_id: String, operation: String, operator: String, location: String },
+    Report { client_id: String, start: u64, end: u64 },
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().with_target(false).init();
+    let cli = Cli::parse();
+    
+    let result = match cli.command {
+        Commands::Encrypt { input, shred, password } => {
+            let password = get_password(password).await;
+            let pw_arc = Arc::new(SecretVec::new(password.as_bytes().to_vec()));
+            match async_encrypt(pw_arc, input, shred).await {
+                Ok((msg, shares, audit_key)) => {
+                    println!("✅ {}", msg);
+                    if !shares.is_empty() {
+                        println!("\n🔑 RECOVERY SHARES (need {} of {}):", SHAMIR_THRESHOLD, SHAMIR_TOTAL);
+                        for share in &shares {
+                            println!("\n📦 Share {}:", share.index);
+                            println!("{}", share.qr_code_ascii);
+                            println!("Hex: {}…", &share.share_hex[..64.min(share.share_hex.len())]);
+                        }
+                        println!("\n⚠️ Store these shares securely!");
+                        println!("🔑 Audit key prefix: {}", audit_key);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(format!("❌ {}", e)),
+            }
+        }
+        Commands::Decrypt { input, password } => {
+            let password = get_password(password).await;
+            let pw_arc = Arc::new(SecretVec::new(password.as_bytes().to_vec()));
+            match async_decrypt(pw_arc, input).await {
+                Ok(msg) => { println!("✅ {}", msg); Ok(()) }
+                Err(e) => Err(format!("❌ {}", e)),
+            }
+        }
+        Commands::Verify { input } => verify_integrity(&input).await,
+        Commands::LtoWrite { input, device, password } => {
+            let password = get_password(password).await;
+            let pw_arc = Arc::new(SecretVec::new(password.as_bytes().to_vec()));
+            let tape = LtoTape::new(&device);
+            match tape.write_encrypted(&input, pw_arc).await {
+                Ok(msg) => { println!("✅ {}", msg); Ok(()) }
+                Err(e) => Err(format!("❌ {}", e)),
+            }
+        }
+        Commands::LtoRead { output, device, password } => {
+            let password = get_password(password).await;
+            let pw_arc = Arc::new(SecretVec::new(password.as_bytes().to_vec()));
+            let tape = LtoTape::new(&device);
+            match tape.read_encrypted(&output, pw_arc).await {
+                Ok(msg) => { println!("✅ {}", msg); Ok(()) }
+                Err(e) => Err(format!("❌ {}", e)),
+            }
+        }
+        Commands::Log { media_id, client_id, operation, operator, location } => {
+            log_physical_operation_direct(&media_id, &client_id, &operation, &operator, &location).await
+        }
+        Commands::Report { client_id, start, end } => {
+            generate_report(&client_id, start, end).await
+        }
+    };
+    
+    if let Err(e) = result {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
+}
+
+async fn get_password(provided: Option<String>) -> String {
+    match provided {
+        Some(pwd) => pwd,
+        None => rpassword::prompt_password("🔑 Master password: ").expect("Failed to read password"),
+    }
+}
+
+async fn verify_integrity(path: &str) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("Cannot open: {}", e))?;
+    let size = file.metadata().map_err(|e| format!("Metadata: {}", e))?.len();
+    if size < HEADER_SIZE { return Err("File too small".to_string()); }
+    let mut reader = std::io::BufReader::new(file);
+    let mut header = [0u8; 200];
+    use std::io::Read;
+    reader.read_exact(&mut header).map_err(|e| format!("Read: {}", e))?;
+    if &header[0..6] != MAGIC_BYTES { return Err("Bad magic".to_string()); }
+    let file_major = u16::from_be_bytes(header[6..8].try_into().unwrap());
+    if file_major != VERSION_MAJOR { return Err(format!("Version mismatch: v{}", file_major)); }
+    println!("✅ Valid Aegis v{} vault, {} bytes", file_major, size);
+    Ok(())
+}
+
+async fn log_physical_operation_direct(media_id: &str, client_id: &str, operation: &str, operator: &str, location: &str) -> Result<(), String> {
+    let op = match operation.to_lowercase().as_str() {
+        "receive" => PhysicalOperation::Receive,
+        "store" => PhysicalOperation::Store,
+        "retrieve" => PhysicalOperation::Retrieve,
+        "ship" => PhysicalOperation::Ship,
+        "destroy" => PhysicalOperation::Destroy,
+        _ => return Err(format!("Unknown: {}", operation)),
+    };
+    let dummy_key = [0u8; 32];
+    let entry = PhysicalAuditEntry {
+        timestamp: unix_now(),
+        operation: op,
+        media_id: media_id.to_string(),
+        client_id: client_id.to_string(),
+        operator_id: operator.to_string(),
+        location: location.to_string(),
+        signature: "".to_string(),
+    };
+    log_physical_operation(entry, &dummy_key).await.map_err(|e| e.to_string())?;
+    println!("✅ Logged {} for media {}", operation, media_id);
+    Ok(())
+}
+
+async fn generate_report(client_id: &str, start: u64, end: u64) -> Result<(), String> {
+    let dummy_key = [0u8; 32];
+    match generate_client_report(client_id, start, end, &dummy_key).await {
+        Ok(report) => { println!("{}", report); Ok(()) }
+        Err(e) => Err(format!("Failed: {}", e)),
+    }
+}

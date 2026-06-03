@@ -1,0 +1,102 @@
+// =============================================================================
+//  AEGIS SOVEREIGN VAULT — v8.2  |  LTO TAPE SUPPORT
+// =============================================================================
+
+use crate::crypto::*;
+use std::path::PathBuf;
+use tokio::fs::File;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
+
+pub struct LtoTape {
+    device_path: PathBuf,
+    block_size: usize,
+}
+
+impl LtoTape {
+    pub fn new(device_path: &str) -> Self {
+        Self {
+            device_path: PathBuf::from(device_path),
+            block_size: 1024 * 1024,
+        }
+    }
+    
+    pub async fn write_encrypted(
+        &self,
+        source_path: &str,
+        password: Arc<SecretVec<u8>>,
+    ) -> Result<String, AegisError> {
+        let temp_path = format!("{}.temp.aegis", source_path);
+        
+        let (result, _, _) = async_encrypt(
+            password,
+            source_path.to_string(),
+            false,
+        ).await?;
+        
+        let mut src = File::open(&temp_path).await
+            .map_err(|e| AegisError::Io(e.to_string()))?;
+        let mut dst = File::create(&self.device_path).await
+            .map_err(|e| AegisError::Io(e.to_string()))?;
+        
+        let mut buffer = vec![0u8; self.block_size];
+        loop {
+            let n = src.read(&mut buffer).await
+                .map_err(|e| AegisError::Io(e.to_string()))?;
+            if n == 0 { break; }
+            dst.write_all(&buffer[..n]).await
+                .map_err(|e| AegisError::Io(e.to_string()))?;
+        }
+        
+        dst.flush().await.map_err(|e| AegisError::Io(e.to_string()))?;
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        
+        Ok(format!("Written to LTO tape: {}", source_path))
+    }
+    
+    pub async fn read_encrypted(
+        &self,
+        output_path: &str,
+        password: Arc<SecretVec<u8>>,
+    ) -> Result<String, AegisError> {
+        let temp_path = format!("{}.temp.aegis", output_path);
+        
+        let mut src = File::open(&self.device_path).await
+            .map_err(|e| AegisError::Io(e.to_string()))?;
+        let mut dst = File::create(&temp_path).await
+            .map_err(|e| AegisError::Io(e.to_string()))?;
+        
+        let mut buffer = vec![0u8; self.block_size];
+        let mut total_read = 0u64;
+        
+        loop {
+            let n = src.read(&mut buffer).await
+                .map_err(|e| AegisError::Io(e.to_string()))?;
+            if n == 0 { break; }
+            dst.write_all(&buffer[..n]).await
+                .map_err(|e| AegisError::Io(e.to_string()))?;
+            total_read += n as u64;
+        }
+        
+        dst.flush().await.map_err(|e| AegisError::Io(e.to_string()))?;
+        
+        if total_read == 0 {
+            return Err(AegisError::Io("No data read from tape".into()));
+        }
+        
+        let result = async_decrypt(password, temp_path.clone()).await?;
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        
+        Ok(result)
+    }
+    
+    pub async fn rewind(&self) -> Result<(), AegisError> {
+        use tokio::io::AsyncSeekExt;
+        use std::io::SeekFrom;
+        
+        let mut file = File::open(&self.device_path).await
+            .map_err(|e| AegisError::Io(e.to_string()))?;
+        file.seek(SeekFrom::Start(0)).await
+            .map_err(|e| AegisError::Io(e.to_string()))?;
+        Ok(())
+    }
+}

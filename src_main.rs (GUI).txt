@@ -1,0 +1,163 @@
+// =============================================================================
+//  AEGIS SOVEREIGN VAULT — v8.2  |  GUI APPLICATION
+// =============================================================================
+
+use aegis_vault::crypto::*;
+use std::sync::Arc;
+use zeroize::Zeroizing;
+use secrecy::SecretVec;
+
+#[cfg(feature = "gui")]
+use iced::{
+    executor, Application, Command, Element, Length, Settings, Theme,
+    widget::{button, checkbox, column, container, row, text, text_input},
+};
+
+#[cfg(feature = "gui")]
+pub fn main() -> iced::Result {
+    tracing_subscriber::fmt().with_target(false).init();
+    AegisVaultGui::run(Settings::default())
+}
+
+#[cfg(not(feature = "gui"))]
+pub fn main() {
+    println!("Aegis Vault v8.2 - GUI mode disabled");
+    println!("Build with --features gui for the desktop application");
+}
+
+#[cfg(feature = "gui")]
+struct AegisVaultGui {
+    password: Zeroizing<String>,
+    file_path: String,
+    status_message: String,
+    shred_file: bool,
+    generated_shares: Vec<RecoveryShare>,
+    audit_key_prefix: String,
+    is_processing: bool,
+    show_shares_panel: bool,
+}
+
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone)]
+enum Message {
+    PasswordChanged(String),
+    FilePathChanged(String),
+    ShredToggled(bool),
+    BrowseFile,
+    EncryptPressed,
+    DecryptPressed,
+    ToggleSharesPanel,
+    EncryptDone(Result<(String, Vec<RecoveryShare>, String), String>),
+    DecryptDone(Result<String, String>),
+}
+
+#[cfg(feature = "gui")]
+impl Application for AegisVaultGui {
+    type Executor = executor::Default;
+    type Message = Message;
+    type Theme = Theme;
+    type Flags = ();
+
+    fn new(_: ()) -> (Self, Command<Message>) {
+        (
+            Self {
+                password: Zeroizing::new(String::new()),
+                file_path: String::new(),
+                status_message: format!("Ready — Aegis v{}", VERSION_MAJOR),
+                shred_file: false,
+                generated_shares: Vec::new(),
+                audit_key_prefix: String::new(),
+                is_processing: false,
+                show_shares_panel: false,
+            },
+            Command::none(),
+        )
+    }
+
+    fn title(&self) -> String {
+        format!("🛡️ Aegis Sovereign Vault v{}", VERSION_MAJOR)
+    }
+
+    fn update(&mut self, msg: Message) -> Command<Message> {
+        match msg {
+            Message::PasswordChanged(p) => { self.password = Zeroizing::new(p); Command::none() }
+            Message::FilePathChanged(p) => { self.file_path = p; Command::none() }
+            Message::ShredToggled(v) => { self.shred_file = v; Command::none() }
+            Message::ToggleSharesPanel => { self.show_shares_panel = !self.show_shares_panel; Command::none() }
+            Message::BrowseFile => {
+                #[cfg(feature = "gui")]
+                if let Some(path) = rfd::FileDialog::new().pick_file() { self.file_path = path.display().to_string(); }
+                Command::none()
+            }
+            Message::EncryptPressed => {
+                if self.password.len() < 12 { self.status_message = "🚨 Password too short.".into(); return Command::none(); }
+                if self.file_path.trim().is_empty() { self.status_message = "🚨 Select a file.".into(); return Command::none(); }
+                self.is_processing = true; self.status_message = "🔐 Deriving Argon2id key...".into();
+                let pw = Arc::new(SecretVec::new(self.password.as_bytes().to_vec()));
+                let path = self.file_path.clone(); let shred = self.shred_file;
+                Command::perform(async move { async_encrypt(pw, path, shred).await.map_err(|e| e.to_string()) }, Message::EncryptDone)
+            }
+            Message::DecryptPressed => {
+                if self.password.len() < 12 { self.status_message = "🚨 Password too short.".into(); return Command::none(); }
+                if self.file_path.trim().is_empty() { self.status_message = "🚨 Select a vault file.".into(); return Command::none(); }
+                self.is_processing = true; self.status_message = "🔓 Verifying password...".into();
+                let pw = Arc::new(SecretVec::new(self.password.as_bytes().to_vec()));
+                let path = self.file_path.clone();
+                Command::perform(async move { async_decrypt(pw, path).await.map_err(|e| e.to_string()) }, Message::DecryptDone)
+            }
+            Message::EncryptDone(r) => {
+                self.is_processing = false;
+                match r {
+                    Ok((msg, shares, ak)) => { self.status_message = format!("✅ {msg}"); self.generated_shares = shares; self.audit_key_prefix = ak; self.show_shares_panel = true; }
+                    Err(e) => self.status_message = format!("🚨 {e}"),
+                }
+                Command::none()
+            }
+            Message::DecryptDone(r) => {
+                self.is_processing = false;
+                match r { Ok(msg) => self.status_message = format!("✅ {msg}"), Err(e) => self.status_message = format!("🚨 {e}") }
+                Command::none()
+            }
+        }
+    }
+
+    fn view(&self) -> Element<Message> {
+        let mut content = column![
+            text(format!("🛡️ AEGIS SOVEREIGN VAULT v{}", VERSION_MAJOR)).size(28),
+            text("AES-256-GCM | Argon2id 128 MiB | Shamir 3-of-5 | Encrypted Audit").size(12),
+            text("Header MAC | KVT Fast-Auth | Nonce Registry | 7-Pass Shred").size(11),
+            text_input("Master password (≥12 chars)...", &self.password).on_input(Message::PasswordChanged).secure(true).padding(12),
+            row![
+                text_input("File path...", &self.file_path).on_input(Message::FilePathChanged).padding(12),
+                button("📂 Browse").on_press(Message::BrowseFile).padding(12),
+            ].spacing(10),
+            checkbox("Permanently shred original (7-pass verified)", self.shred_file).on_toggle(Message::ShredToggled),
+            if self.is_processing { text(format!("⏳ {}", self.status_message)).size(14).into() }
+            else {
+                row![
+                    button("🔒 Encrypt & Generate Shares").on_press(Message::EncryptPressed).padding(14),
+                    button("🔓 Decrypt Vault").on_press(Message::DecryptPressed).padding(14),
+                ].spacing(20).into()
+            },
+            text(&self.status_message).size(14),
+        ].spacing(18).max_width(760);
+        
+        if self.show_shares_panel && !self.generated_shares.is_empty() {
+            content = content.push(text("─────────────────────────────────────────────").size(11));
+            content = content.push(text(format!("🔑 Recovery Shares (need any {} of {})", SHAMIR_THRESHOLD, SHAMIR_TOTAL)).size(14));
+            for share in &self.generated_shares {
+                content = content.push(text(format!("📦 Share {}:", share.index)).size(12));
+                content = content.push(text(&share.qr_code_ascii).size(8));
+                content = content.push(text(format!("Hex: {}…", &share.share_hex[..64.min(share.share_hex.len())])).size(10));
+            }
+            content = content.push(text(format!("🔑 Audit key prefix: {}", self.audit_key_prefix)).size(10));
+            content = content.push(button("✅ I have stored all shares securely").on_press(Message::ToggleSharesPanel).padding(10));
+        }
+        
+        content = content.push(text("⚠️ SSD/NVMe: 7-pass shred is best-effort. Use full-disk encryption for complete protection.").size(10));
+        
+        container(content).width(Length::Fill).height(Length::Fill).center_x().center_y().padding(48).into()
+    }
+
+    fn theme(&self) -> Theme { Theme::Dark }
+}
